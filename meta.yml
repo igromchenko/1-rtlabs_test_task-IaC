@@ -1,0 +1,11 @@
+#cloud-config
+users:
+  - name: igromchenko
+    groups: sudo
+    shell: /bin/bash
+    sudo: ['ALL=(ALL) NOPASSWD:ALL']
+    ssh_authorized_keys:
+      - "ТУТ НЕОБХОДИМО УКАЗАТЬ СОДЕРЖИМОЕ ПУБЛИЧНОГО SSH-КЛЮЧА КЛИЕНТСКОГО ПК (id_rsa.pub)"
+
+packages_updated: true
+packages_upgradet: true

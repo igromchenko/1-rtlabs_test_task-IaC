@@ -1,0 +1,291 @@
+---
+- name: "Installing Kubernetes on the cluster nodes"
+  hosts: k8s_cluster
+  remote_user: igromchenko
+  become: yes
+  become_method: sudo
+  gather_facts: no
+  
+  tasks:
+  - apt:
+      upgrade: "yes"
+      update_cache: yes
+    retries: 10
+    delay: 10
+    register: result
+    until: result is succeeded
+
+  - get_url:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      dest: /usr/share/keyrings/kubernetes-archive-keyring.gpg
+  
+  - apt_repository:
+      repo: deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main
+      filename: kubernetes
+
+  - get_url:
+      url: https://download.docker.com/linux/debian/gpg
+      dest: /usr/share/keyrings/docker-archive-keyring.asc
+
+  - apt_repository:
+      repo: deb [signed-by=/usr/share/keyrings/docker-archive-keyring.asc] https://download.docker.com/linux/debian stretch stable
+      filename: docker
+
+  - apt:
+      pkg:
+      - kubeadm
+      - containerd.io
+
+  - ansible.posix.sysctl:
+      name: net.ipv4.ip_forward
+      value: "1"
+
+  - community.general.modprobe:
+      name: br_netfilter
+
+  - file:
+      path: /etc/containerd/config.toml
+      state: absent
+
+  - service:
+      name: containerd
+      state: restarted
+
+- name: "Configuring Master node"
+  hosts: master_node
+  remote_user: igromchenko
+  become: yes
+  become_method: sudo
+  gather_facts: no
+  
+  tasks:
+  - shell:
+      cmd: kubeadm init
+
+  - shell:
+      cmd: kubeadm token create --print-join-command
+    register: join_command
+
+  - set_fact:
+      join_command: "{{ join_command.stdout }}"
+      cacheable: yes
+
+  - file:
+      dest: /home/igromchenko/.kube/
+      state: directory
+      owner: igromchenko
+      group: igromchenko
+
+  - copy:
+      remote_src: yes
+      src: /etc/kubernetes/admin.conf
+      dest: /home/igromchenko/.kube/config
+      owner: igromchenko
+      group: igromchenko
+      mode: "600"
+
+- name: "Adding Worker node to the cluster"
+  hosts: worker_node
+  remote_user: igromchenko
+  become: yes
+  become_method: sudo
+  gather_facts: no
+
+  tasks:
+  - shell:
+      cmd: "{{ hostvars['master_node']['join_command'] }}"
+
+  - shell:
+      cmd: hostname
+    register: hostname
+
+  - set_fact:
+      hostname: "{{ hostname.stdout }}"
+      cacheable: yes
+
+  - shell:
+      cmd: hostname -I
+    register: ip_address
+
+  - set_fact:
+      ip_address: "{{ ip_address.stdout }}"
+      cacheable: yes
+
+- name: "Configuring the cluster"
+  hosts: master_node
+  remote_user: igromchenko
+  gather_facts: no
+
+  tasks:
+  - shell:
+      cmd: kubectl label nodes "{{ hostvars['worker_node']['hostname'] }}" kubernetes.io/role=worker
+
+  - shell:
+      cmd: kubectl apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml
+
+  - fetch:
+      src: /home/igromchenko/.kube/config
+      dest: /home/igromchenko/.kube/config
+      flat: true
+
+- name: "Seting up GitLab/Monitoring server"
+  hosts: server
+  remote_user: igromchenko
+  become: yes
+  become_method: sudo
+  gather_facts: no
+  vars_files: gitlab-token.yml
+
+  tasks:
+  - apt:
+      upgrade: "yes"
+      update_cache: yes
+    retries: 10
+    delay: 10
+    register: result
+    until: result is succeeded
+
+  - get_url:
+      url: https://download.docker.com/linux/debian/gpg
+      dest: /usr/share/keyrings/docker-archive-keyring.asc
+
+  - apt_repository:
+      repo: deb [signed-by=/usr/share/keyrings/docker-archive-keyring.asc] https://download.docker.com/linux/debian stretch stable
+      filename: docker
+
+  - apt:
+      pkg:
+      - docker-ce
+
+  - copy:
+      src: /home/igromchenko/.kube/config
+      dest: /home/igromchenko/.kube/
+      mode: "600"
+
+  - file:
+      dest: /home/igromchenko/.kube
+      state: absent
+    delegate_to: localhost
+    become: no   
+
+  - shell:
+      cmd: docker run -d --rm --name gitlab-runner -v /srv/gitlab-runner/config:/etc/gitlab-runner gitlab/gitlab-runner:latest register --non-interactive --url "https://gitlab.com/" --registration-token "{{ gitlab_token  }}" --executor "docker" --docker-image docker:latest --description "srv-runner"
+
+  - pause:
+      seconds: 10
+
+  - replace:
+      path: /srv/gitlab-runner/config/config.toml
+      regexp: 'volumes = \["/cache"\]'
+      replace: 'volumes = ["/cache", "/srv/gitlab-runner/config:/etc/gitlab-runner", "/var/run/docker.sock:/var/run/docker.sock", "/home/igromchenko/.kube:/root/.kube"]'
+
+  - shell:
+      cmd: docker run -d --name gitlab-runner --restart always -v /srv/gitlab-runner/config:/etc/gitlab-runner -v /var/run/docker.sock:/var/run/docker.sock -v /home/igromchenko/.kube:/root/.kube gitlab/gitlab-runner:latest
+
+  - user:
+      name: prometheus
+      create_home: false
+      shell: /bin/false
+
+  - get_url:
+      url: https://github.com/prometheus/prometheus/releases/download/v2.40.5/prometheus-2.40.5.linux-amd64.tar.gz 
+      dest: .
+
+  - unarchive:
+      remote_src: true
+      src: prometheus-2.40.5.linux-amd64.tar.gz
+      dest: .
+
+  - copy:
+      remote_src: true
+      src: prometheus-2.40.5.linux-amd64/prometheus
+      dest: /usr/local/bin/
+      mode: 755
+      owner: prometheus
+      group: prometheus
+
+  - copy:
+      remote_src: true
+      src: prometheus-2.40.5.linux-amd64/promtool
+      dest: /usr/local/bin/
+      mode: 755
+      owner: prometheus
+      group: prometheus
+
+  - copy:
+      remote_src: true
+      src: prometheus-2.40.5.linux-amd64/console_libraries
+      dest: /etc/prometheus
+      owner: prometheus
+      group: prometheus
+
+  - copy:
+      remote_src: true
+      src: prometheus-2.40.5.linux-amd64/consoles
+      dest: /etc/prometheus
+      owner: prometheus
+      group: prometheus
+
+  - copy:
+      src: prometheus.yml
+      dest: /etc/prometheus/
+      owner: prometheus
+      group: prometheus
+
+  - file:
+      path: prometheus-2.40.5.linux-amd64
+      state: absent
+
+  - file:
+      path: prometheus-2.40.5.linux-amd64.tar.gz
+      state: absent
+
+  - shell:
+      cmd: nohup prometheus --config.file /etc/prometheus/prometheus.yml --storage.tsdb.path /var/lib/prometheus/ --web.console.templates=/etc/prometheus/consoles --web.console.libraries=/etc/prometheus/console_libraries > /dev/null 2>&1 &
+
+  - user:
+      name: blackbox_exporter
+      create_home: false
+      shell: /bin/false
+
+  - get_url:
+      url: https://github.com/prometheus/blackbox_exporter/releases/download/v0.23.0/blackbox_exporter-0.23.0.linux-amd64.tar.gz
+      dest: .
+
+  - unarchive:
+      remote_src: true
+      src: blackbox_exporter-0.23.0.linux-amd64.tar.gz
+      dest: .
+
+  - copy:
+      remote_src: true
+      src: blackbox_exporter-0.23.0.linux-amd64/blackbox_exporter
+      dest: /usr/local/bin/
+      mode: 755
+      owner: blackbox_exporter
+      group: blackbox_exporter
+
+  - copy:
+      remote_src: true
+      src: blackbox_exporter-0.23.0.linux-amd64/blackbox.yml
+      dest: /etc/blackbox_exporter/
+      owner: blackbox_exporter
+      group: blackbox_exporter
+
+  - file:
+      path: blackbox_exporter-0.23.0.linux-amd64
+      state: absent
+
+  - file:
+      path: blackbox_exporter-0.23.0.linux-amd64.tar.gz
+      state: absent
+
+  - shell:
+      cmd: nohup blackbox_exporter --config.file /etc/blackbox_exporter/blackbox.yml > /dev/null 2>&1 &
+
+  - apt:
+      deb: https://dl.grafana.com/oss/release/grafana_9.3.0_amd64.deb
+
+  - service:
+      name: grafana-server
+      state: started
